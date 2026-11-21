@@ -1,0 +1,45 @@
+FILEDESK PRESENTATION - 7 SLIDES
+Add team names and student IDs before presenting.
+
+SLIDE 1: FileDesk
+File Management System
+Operating Systems course project
+Speaker: Introduce the team and show the running application.
+
+SLIDE 2: Project objective
+Manage persistent files through a desktop interface.
+Demonstrate filesystem services from the OS lectures.
+Speaker: Explain that this is an application using host OS services.
+
+SLIDE 3: Main features
+Create and organize files and directories.
+Read and write UTF-8 text.
+Rename, copy, move, and delete items.
+Filter names, inspect metadata, and create ZIP backups.
+Speaker: Point to the corresponding controls in a screenshot or live app.
+
+SLIDE 4: Architecture
+Native Win32 GUI handles user interaction.
+FileStore validates and executes operations.
+C++ filesystem and stream APIs request services from the host OS.
+The host OS manages physical storage and permissions.
+Speaker: Walk through Save: editor text, FileStore.write, C++ file stream, host filesystem.
+
+SLIDE 5: OS concepts in practice
+Directories organize persistent data.
+File helpers perform open, read/write, and close operations.
+Metadata includes file size and last modification time.
+ZIP archives provide a backup copy.
+Sources: 1.pdf slide 1.39; 2.pdf slides 2.4, 2.21, 2.29.
+
+SLIDE 6: Demonstration and tests
+Create a folder and text file, save content, and reopen it.
+Copy and rename the file, filter the listing, and create a backup.
+Ten C++ test groups passed using temporary directories.
+Speaker: Demonstrate a duplicate-name error and confirmed deletion.
+
+SLIDE 7: Limits and future improvements
+Current scope: single user, UTF-8 editing, current-folder filtering.
+Host OS permissions remain authoritative.
+Future work: recycle bin, recursive search, background operations.
+Speaker: Conclude with the main learning outcome: connecting a GUI to real filesystem operations.

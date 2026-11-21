@@ -1,0 +1,11 @@
+__pycache__/
+storage/
+backups/
+tmp/
+
+build/
+*.exe
+*.obj
+*.zip
+legacy/
+*.exe.manifest

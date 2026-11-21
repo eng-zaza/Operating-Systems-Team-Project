@@ -1,0 +1,27 @@
+FILEDESK: FILE MANAGEMENT SYSTEM
+Operating Systems Project - Short Report
+
+1. Objective
+FileDesk provides a graphical interface for managing persistent files and directories. It demonstrates the file-management services introduced in the supplied Operating Systems lectures. The goal is to make common filesystem operations accessible while clearly separating interface logic from storage operations.
+
+2. Course connection
+Lecture 1, slide 1.39, describes directory organization, file creation and deletion, file manipulation, and backups. Lecture 2, slides 2.4, 2.21, and 2.29, describes filesystem services and system programs. FileDesk implements an application-level example of these ideas through C++ filesystem and stream APIs. The host operating system performs disk allocation and enforces account permissions. This project does not implement a kernel or disk filesystem.
+
+3. Implemented functionality
+Users can create files and folders, navigate directories, edit UTF-8 text, rename items, copy or move items, and delete items after confirmation. A case-insensitive name filter finds items within the current directory. The list displays item type, byte size, and modification time. Uncompressed ZIP backups preserve files and empty folders outside the managed storage directory. The ZIP writer streams file data and records CRC-32 checksums.
+
+4. Design and implementation
+The application uses C++17 and the native Win32 API. FileStore validates paths and performs operations using std::filesystem, file streams, and a ZIP writer. FileDesk provides navigation controls, a file table, action buttons, a text editor, error dialogs, and status messages. Data lives in the storage directory, so it remains available after the application exits. Copy and rename operations reject existing destination names. Linked paths are unsupported, and operations reject paths outside storage.
+
+5. Validation
+The C++ test executable passed ten groups of checks. They cover the file lifecycle, persistence across service instances, Unicode text, backup contents and empty directories, path escape and root deletion, invalid and duplicate names, copying a folder into itself, and binary text-editor rejection. Tests use temporary storage, independently of user files. The application compiles with MSVC at warning level 4. ZIP contents were independently checked for CRC integrity and Unicode text preservation.
+
+6. Limitations and future work
+The Windows GUI supports UTF-8 text files up to 2 MB. ZIP backups use the classic ZIP format, with a 4 GB archive limit and up to 65,535 entries; original modification times are not retained in ZIP metadata. Search is limited to the displayed directory. Access control comes from the host OS; there is no application login or ACL editor. File operations run synchronously, and deletion is permanent. Possible extensions include a recycle bin, background workers, recursive search, backup restoration, and permission inspection. The managed directory is an organizational boundary, not a hardened sandbox against concurrent filesystem manipulation.
+
+7. Conclusion
+FileDesk connects lecture concepts to working filesystem operations through a usable desktop interface. Its separated service layer makes behavior testable and keeps the implementation small enough to explain during a project demonstration.
+
+References
+Supplied 1.pdf: Operating System Concepts, Chapter 1, slide 1.39.
+Supplied 2.pdf: Operating-System Structures, slides 2.4, 2.21, 2.29.
