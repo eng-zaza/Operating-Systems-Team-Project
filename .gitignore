@@ -1,5 +1,6 @@
 __pycache__/
 storage/
+storage.trash/
 backups/
 tmp/
 
@@ -9,3 +10,4 @@ build/
 *.zip
 legacy/
 *.exe.manifest
+deliverables/

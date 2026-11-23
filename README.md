@@ -1,40 +1,71 @@
 # FileDesk - C++ File Management System
 
-A C++17 desktop project using the native Windows API (Win32). Python and third-party GUI libraries are not required.
+FileDesk is a C++17 desktop project using the native Windows API. It manages real files, searches nested folders, recovers recycled items, and performs long operations on a worker thread. No Python or third-party GUI library is required to run it.
 
-## Run
+## Run and build
 
-Extract the project ZIP, then double-click FileDesk.exe or launch.bat on 64-bit Windows. Keep the project in a writable folder. Files persist in storage/ beside the executable; ZIP backups go into backups/.
+Extract the complete project ZIP into a writable folder and open `FileDesk.exe` or `launch.bat` on 64-bit Windows. To compile, install Visual Studio 2022 or its Build Tools with **Desktop development with C++** and a Windows SDK, then run `build.bat`. The script builds with `/W4`, embeds the native-controls manifest, links the static C++ runtime (`/MT`), builds the tests, and runs them.
 
-## Build from source
+## Features
 
-Install Visual Studio 2022 or its Build Tools with Desktop development with C++ and a Windows SDK. Run build.bat. It locates MSVC, builds the application, builds the C++ tests, and runs them. The executable uses the static C++ runtime (/MT).
+- Native file and folder icons, a resizable table, readable sizes, location columns, context menus, and helpful empty-state/status messages.
+- Create folders and files; edit UTF-8 text up to 2 MB; rename, copy, and move items without overwriting existing destinations.
+- Search names in the current folder or recursively through its subfolders. Results show each item's location and support normal file actions.
+- Recycle files or complete folders and restore them later, including after restarting the app. Existing files are never replaced during restore.
+- Background copying, moving, renaming, recycling, restoring, searching, listing, and ZIP backup. Progress animates while scanning and shows a percentage when the total is known.
+- One background job at a time. Conflicting actions are disabled while the window remains responsive; closing waits for the job to finish.
 
-- src/main.cpp: native window, file table, dialogs, editor, and event handlers.
-- src/store.hpp: filesystem service, UTF-8 conversion, validation, and ZIP writer.
-- tests/store_tests.cpp: storage tests using temporary directories.
-- deliverables/: PDF report, editable text, slide outline, and demo script.
+## How to use it
 
-## Features and usage
+Double-click a file or folder to open it. Home returns to Storage and Up goes to the parent. For Copy and Move, enter an existing destination relative to Storage (for example `Documents`), or `.` for the root. Enter a different destination name when copying into the same folder.
 
-Create files and nested folders; edit UTF-8 text up to 2 MB; rename, copy, move, and delete items; filter names; view sizes and modification times; create ZIP backups.
+Type a filename or part of a name, then click Search or press Enter. **Include subfolders** is enabled by default. An empty search lists only the current folder. Search is by name, not file contents, and shows up to 5,000 matches. Clear returns to the current folder listing.
 
-Double-click to open an item. Home and Up navigate folders. Copy and Move ask for an existing destination relative to Storage, such as Documents, or . for the root. Refresh or F5 reloads the listing. The editor supports Ctrl+S and asks before discarding changes. Delete requires confirmation and is permanent. Saves replace the original after successfully writing and flushing a temporary file.
+Recycle or Delete moves the selection into FileDesk's own recycle bin after confirmation. Click Recycle bin, select an item, and click Restore (or double-click it). Restore recreates missing parent folders. If the original name already exists, rename or move that active item and retry. There is no permanent-delete button or automatic bin cleanup.
 
-## Course connection
+Backup ZIP writes a timestamped archive containing active Storage items. Recycled items are excluded. ZIP restoration is manual extraction; the Restore button applies only to recycled items.
 
-The GUI calls FileStore, which requests host OS services through std::filesystem, C++ streams, and Win32 calls. RAII streams close file handles when they leave scope. The host OS manages physical storage and account permissions. This is an application-level system program, not a kernel or disk filesystem implementation.
+| Shortcut | Action |
+| --- | --- |
+| Ctrl+F | Focus search |
+| Enter in search | Run search |
+| Enter on a selected row | Open; restore in the recycle bin |
+| F2 | Rename selected active item |
+| Delete | Move selected active item to recycle bin |
+| F5 | Refresh |
+| Ctrl+S in editor | Save |
 
-Sources: supplied 1.pdf, slide 1.39; 2.pdf, slides 2.4, 2.21, 2.29.
+Right-click an item for its available actions. The editor asks before discarding unsaved changes. Saves write and flush a temporary file before replacing the previous file.
 
-## Verification
+## Storage and source layout
 
-The MSVC build passes at warning level 4. Ten C++ test groups cover file lifecycle, Unicode persistence, duplicate protection, invalid names, path boundaries, root protection, recursive-copy rejection, ZIP backup, binary-file rejection, and deletion. An independent ZIP reader checked CRC integrity, Unicode content, and empty directories. A native GUI smoke test checked startup, the file table, Home, and Refresh. Visual inspection of the native GUI could not be completed because this session returns black screenshots.
+`storage/` holds active files beside the executable. `storage.trash/` holds recycled payloads and their original paths/deletion dates. Keep both folders to preserve recovery across upgrades. `backups/` contains ZIP archives. These runtime folders are excluded from Git and the project ZIP.
 
-## Limits
+- `src/main.cpp`: Win32 interface, dialogs, context menus, worker lifecycle, atomic progress counters, and completion polling.
+- `src/store.hpp`: path validation, UTF-8 I/O, recursive search, recycle records, restore, chunked copying, and ZIP writer.
+- `tests/store_tests.cpp`: isolated tests using temporary directories and injected failures.
+- `deliverables/` in the local download package: report, presentation outline, demo script, and validation notes. Generated submission materials are kept outside the source repository to preserve the repository owner's removal of the previous documents.
 
-Windows-only GUI; single user; current-folder filtering; UTF-8 editing only. Binary files can be copied and backed up. Operations run synchronously, so large backups can temporarily block the interface. ZIP output is uncompressed, under 4 GB total, and limited to 65,535 entries. ZIP metadata does not retain original timestamps or ACLs. Restore manually by extracting the ZIP. Host account permissions remain authoritative. Storage containment is not a hardened sandbox against concurrent filesystem changes. Avoid editing the same files with another program while operations run.
+## Architecture and OS concepts
+
+The Win32 message loop runs on the UI thread. `std::async(std::launch::async)` starts a worker for one background job. The worker reports atomic counters and returns a `Result` through a future. A UI timer polls that future without waiting; all window updates stay on the UI thread. Serializing jobs avoids conflicting operations within one app instance.
+
+FileStore uses `std::filesystem`, RAII streams, and Win32 file calls to request host OS services. Recycle records preserve the original relative path while moving the payload outside active storage. The OS manages physical storage and account permissions. This is a user-space application, not a kernel or disk filesystem.
+
+Course references: supplied `1.pdf`, slide 1.39; `2.pdf`, slides 2.4, 2.21, 2.29. Worker/UI separation also demonstrates practical process/thread execution concepts.
+
+## Validation
+
+Run `build.bat` for the full build and C++ tests. Tests cover the original file lifecycle, Unicode persistence, naming/path rules, duplicate protection, ZIP creation, recursive search, recycle persistence, folder recovery, missing parents, restore conflicts, malformed/CRLF metadata, progress monotonicity, and cleanup after injected copy/backup failures. Independent ZIP checks validate CRCs and preserved contents. Native GUI checks covered the layout, icons, nested search, completed progress state, recycle-bin listing, restoration, and a roughly 50 MB background backup. The local package includes `deliverables/validation.txt` with details.
+
+## Limits and future work
+
+Windows-only and intended for one active instance. The managed directory is not a hardened sandbox against concurrent external filesystem changes. Linked paths and junctions are unsupported. Some inaccessible search entries are skipped and counted. Search results are capped at 5,000. Unicode case matching follows the C runtime's character conversion. Text editing is UTF-8 only, limited to 2 MB.
+
+Background jobs cannot currently be cancelled. Small create/read/save actions and final table rendering run on the UI thread. Recycled items occupy disk space until restored or managed outside the app. Classic ZIP output is uncompressed, under 4 GB total, and limited to 65,535 entries; original timestamps and ACLs are not preserved in archive metadata. Host OS permissions remain authoritative.
+
+Possible next additions: cancellable jobs, ZIP restore, file-content search, and a confirmed permanent-cleanup workflow for recycled data.
 
 ## Submission
 
-The updated editable presentation is at page://page_b725aa5ad6b88191a28e213d990a7514; export it as PowerPoint from the viewer. Add team names and IDs. The demo video still needs recording; use deliverables/demo-script.txt. The registration form has not been submitted.
+The editable seven-slide deck is at page://page_b725aa5ad6b88191a28e213d990a7514; export to PowerPoint from the viewer. Its text outline is included in the local download package. Add team names and IDs, and record the revised demo script. The demo video and team registration remain pending.

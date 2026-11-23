@@ -11,7 +11,14 @@
 #include <stdexcept>
 #include <cstdint>
 #include <cwctype>
+#include <functional>
+#include <atomic>
+#include <chrono>
 namespace fs = std::filesystem;
+using Progress = std::function<void(uint64_t,uint64_t)>;
+inline void report(const Progress& progress,uint64_t done,uint64_t total){if(progress)progress(done,total);}
+struct TrashItem {std::wstring id;fs::path original;std::wstring deleted;bool folder;};
+struct SearchResult {std::vector<fs::path> paths;size_t skipped=0;bool truncated=false;};
 
 inline std::wstring wide(const std::string& s) {
     if(s.empty()) return {};
@@ -87,21 +94,105 @@ public:
         if(ok)ok=FlushFileBuffers(h)!=0;CloseHandle(h);
         if(!ok || !MoveFileExW(temp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) {DeleteFileW(temp.c_str());throw std::runtime_error("Could not save. The previous file was preserved.");}
     }
-    void transfer(const fs::path& relative,const fs::path& destination,const std::wstring& name,bool move) {
+    void transfer(const fs::path& relative,const fs::path& destination,const std::wstring& name,bool move,Progress progress={}) {
         auto src=path(relative),dst=fresh(destination,name);
         if(src==root_)throw std::runtime_error("The storage root cannot be moved or copied.");
         checkTree(src);
         if(fs::is_directory(src) && within(dst,src))throw std::runtime_error("Choose a destination outside the source folder.");
-        if(move)fs::rename(src,dst);else fs::copy(src,dst,fs::copy_options::recursive);
+        if(move){report(progress,0,1);fs::rename(src,dst);report(progress,1,1);return;}
+        std::vector<fs::path> files{src};
+        if(fs::is_directory(src))for(auto& e:fs::recursive_directory_iterator(src))files.push_back(e.path());
+        uint64_t total=0,done=0;for(auto& p:files)total+=fs::is_directory(p)?1:fs::file_size(p)+1;
+        report(progress,0,total);
+        // All destinations are new: a failed copy can remove only its own partial result.
+        bool created=false;
+        try{for(auto& p:files){
+            auto target=p==src?dst:dst/p.lexically_relative(src);
+            if(fs::is_directory(p)){fs::create_directory(target);created=true;report(progress,++done,total);continue;}
+            std::ifstream in(p,std::ios::binary);if(!in)throw std::runtime_error("Cannot read source file.");
+            std::ofstream out(target,std::ios::binary);if(!out)throw std::runtime_error("Cannot create destination file.");created=true;
+            char buffer[65536];while(in.read(buffer,sizeof buffer)||in.gcount()) {out.write(buffer,in.gcount());done+=(uint64_t)in.gcount();report(progress,done,total);if(!out)throw std::runtime_error("Copy write failed.");}
+            if(!in.eof())throw std::runtime_error("Copy read failed.");out.flush();if(!out)throw std::runtime_error("Copy write failed.");out.close();
+            fs::last_write_time(target,fs::last_write_time(p));report(progress,++done,total);
+        }}catch(...){if(created){std::error_code ec;fs::remove_all(dst,ec);}throw;}
     }
     void remove(const fs::path& relative) {
         auto p=path(relative);if(p==root_)throw std::runtime_error("The storage root cannot be deleted.");
         checkTree(p);fs::remove_all(p);
     }
-    void backup(const fs::path& destination)const {
+    fs::path trashRoot()const {
+        auto root=root_.parent_path()/(root_.filename().wstring()+L".trash");
+        DWORD attr=GetFileAttributesW(root.c_str());
+        if(attr!=INVALID_FILE_ATTRIBUTES && (attr&FILE_ATTRIBUTE_REPARSE_POINT))throw std::runtime_error("Recycle bin cannot be a linked folder.");
+        fs::create_directories(root);return root;
+    }
+    std::wstring recycle(const fs::path& relative,Progress progress={}) {
+        auto src=path(relative);if(src==root_)throw std::runtime_error("The storage root cannot be recycled.");checkTree(src);
+        static std::atomic<unsigned> serial{0};
+        auto id=std::to_wstring(std::chrono::system_clock::now().time_since_epoch().count())+L"-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(serial++);
+        auto record=trashRoot()/id;if(!fs::create_directory(record))throw std::runtime_error("Cannot create recycle record.");
+        SYSTEMTIME t;GetLocalTime(&t);wchar_t date[40];swprintf_s(date,L"%04u-%02u-%02u %02u:%02u",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute);
+        try{
+            std::ofstream meta(record/L"original.txt",std::ios::binary);meta<<utf8(src.lexically_relative(root_).wstring())<<'\n'<<utf8(date)<<'\n';meta.close();if(!meta)throw std::runtime_error("Cannot save recycle metadata.");
+            report(progress,0,1);fs::rename(src,record/L"payload");
+        }catch(...){std::error_code ec;fs::remove_all(record,ec);throw;}
+        report(progress,1,1);return id;
+    }
+    std::vector<TrashItem> trashItems()const {
+        std::vector<TrashItem> result;
+        for(auto& e:fs::directory_iterator(trashRoot())){
+            try{
+                auto attr=GetFileAttributesW(e.path().c_str());if(attr==INVALID_FILE_ATTRIBUTES || (attr&FILE_ATTRIBUTE_REPARSE_POINT) || !e.is_directory())continue;
+                for(auto leaf:{L"original.txt",L"payload"}){auto a=GetFileAttributesW((e.path()/leaf).c_str());if(a==INVALID_FILE_ATTRIBUTES || (a&FILE_ATTRIBUTE_REPARSE_POINT))throw std::runtime_error("Invalid recycle record.");}
+                if(fs::file_size(e.path()/L"original.txt")>65536)continue;
+                std::ifstream meta(e.path()/L"original.txt",std::ios::binary);std::string original,deleted;std::getline(meta,original);std::getline(meta,deleted);
+                if(!original.empty() && original.back()=='\r')original.pop_back();
+                if(!deleted.empty() && deleted.back()=='\r')deleted.pop_back();
+                if(original.empty() || std::any_of(original.begin(),original.end(),[](unsigned char c){return c<32;}))continue;
+                auto rel=fs::path(wide(original));if(path(rel)==root_)continue;
+                result.push_back({e.path().filename().wstring(),rel,wide(deleted),fs::is_directory(e.path()/L"payload")});
+            }catch(const std::exception&){continue;}
+        }
+        std::sort(result.begin(),result.end(),[](auto& a,auto& b){return a.deleted>b.deleted;});return result;
+    }
+    fs::path restore(const std::wstring& id,Progress progress={}) {
+        auto records=trashItems();auto it=std::find_if(records.begin(),records.end(),[&](auto& r){return r.id==id;});
+        if(it==records.end())throw std::runtime_error("Recycle item is unavailable.");
+        auto dest=path(it->original);if(fs::exists(dest))throw std::runtime_error("Restore would overwrite an existing item. Rename or move that item first.");
+        auto record=trashRoot()/id;
+        // Validate every payload child before moving a recycled directory back.
+        FileStore bin(record);bin.checkTree(bin.path(L"payload"));
+        report(progress,0,1);fs::create_directories(path(it->original.parent_path()));
+        fs::rename(record/L"payload",dest);
+        std::error_code ec;fs::remove(record/L"original.txt",ec);fs::remove(record,ec);
+        report(progress,1,1);return it->original;
+    }
+    SearchResult search(const fs::path& start,const std::wstring& query,bool recursive,Progress progress={})const {
+        SearchResult result;std::vector<fs::path> pending{path(start)};auto needle=lower(query);uint64_t scanned=0;
+        while(!pending.empty()){
+            auto folder=pending.back();pending.pop_back();
+            std::error_code ec;fs::directory_iterator it(folder,ec),end;if(ec){++result.skipped;continue;}
+            while(it!=end){
+                auto p=it->path();
+                try{
+                    auto relative=p.lexically_relative(root_);path(relative);
+                    if(recursive && fs::is_directory(p))pending.push_back(p);
+                    if(lower(p.filename().wstring()).find(needle)!=std::wstring::npos){
+                        if(result.paths.size()==5000){result.truncated=true;return result;}
+                        result.paths.push_back(relative);
+                    }
+                }catch(const std::exception&){++result.skipped;}
+                report(progress,++scanned,0);it.increment(ec);if(ec){++result.skipped;break;}
+            }
+        }
+        return result;
+    }
+    void backup(const fs::path& destination,Progress progress={})const {
         auto dest=fs::absolute(destination).lexically_normal();
         if(within(dest,root_) || fs::exists(dest))throw std::runtime_error("Choose a new backup file outside Storage.");
         checkTree(root_);
+        uint64_t total=0,done=0;for(auto& e:fs::recursive_directory_iterator(root_))total+=e.is_directory()?1:fs::file_size(e.path())+1;
+        report(progress,0,total);
         struct Entry{std::string name;uint32_t crc,size,offset;};std::vector<Entry> entries;
         std::ofstream out(dest,std::ios::binary);if(!out)throw std::runtime_error("Cannot create backup.");
         auto u16=[&](uint16_t v){out.put(char(v));out.put(char(v>>8));};
@@ -120,12 +211,12 @@ public:
                 if(!dir) {
                     std::ifstream in(item.path(),std::ios::binary);if(!in)throw std::runtime_error("Cannot read a file during backup.");
                     char buffer[65536];while(in.read(buffer,sizeof buffer) || in.gcount()) {
-                        auto count=in.gcount();written+=count;out.write(buffer,count);
+                        auto count=in.gcount();written+=count;out.write(buffer,count);done+=(uint64_t)count;report(progress,done,total);
                         for(std::streamsize i=0;i<count;++i){crc^=(unsigned char)buffer[i];for(int j=0;j<8;++j)crc=(crc>>1)^(0xedb88320u& (0u-(crc&1)));}
                     }
                     if(!in.eof() || written!=size)throw std::runtime_error("File changed or could not be read during backup.");
                 }
-                e.crc=crc^0xffffffff;u32(0x08074b50);u32(e.crc);u32(e.size);u32(e.size);entries.push_back(e);
+                e.crc=crc^0xffffffff;u32(0x08074b50);u32(e.crc);u32(e.size);u32(e.size);entries.push_back(e);report(progress,++done,total);
             }
             uint32_t start=position();
             for(auto& e:entries){u32(0x02014b50);u16(20);u16(20);u16(0x808);u16(0);u16(0);u16(33);u32(e.crc);u32(e.size);u32(e.size);u16((uint16_t)e.name.size());u16(0);u16(0);u16(0);u16(0);u32(e.name.back()=='/'?16:0);u32(e.offset);out.write(e.name.data(),e.name.size());}

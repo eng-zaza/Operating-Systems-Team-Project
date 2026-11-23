@@ -11,7 +11,7 @@ call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
 if errorlevel 1 exit /b 1
 :compile
 if not exist build mkdir build
-cl /nologo /std:c++17 /EHsc /W4 /utf-8 /MT /DUNICODE /D_UNICODE src\main.cpp /Fo:build\main.obj /Fe:FileDesk.exe /link /SUBSYSTEM:WINDOWS
+cl /nologo /std:c++17 /EHsc /W4 /utf-8 /MT /DUNICODE /D_UNICODE src\main.cpp /Fo:build\main.obj /Fe:FileDesk.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /EHsc /W4 /utf-8 /MT /DUNICODE /D_UNICODE tests\store_tests.cpp /Fo:build\tests.obj /Fe:build\store_tests.exe
 if errorlevel 1 exit /b 1
