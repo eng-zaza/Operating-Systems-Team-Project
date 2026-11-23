@@ -19,6 +19,7 @@ using Progress = std::function<void(uint64_t,uint64_t)>;
 inline void report(const Progress& progress,uint64_t done,uint64_t total){if(progress)progress(done,total);}
 struct TrashItem {std::wstring id;fs::path original;std::wstring deleted;bool folder;};
 struct SearchResult {std::vector<fs::path> paths;size_t skipped=0;bool truncated=false;};
+struct PasteResult {size_t completed=0,skipped=0;std::vector<std::wstring> errors;};
 
 inline std::wstring wide(const std::string& s) {
     if(s.empty()) return {};
@@ -48,6 +49,12 @@ class FileStore {
 public:
     explicit FileStore(fs::path root):root_(fs::absolute(root).lexically_normal()) {fs::create_directories(root_);path(L".");}
     const fs::path& root()const{return root_;}
+    bool contains(const fs::path& absolute)const{return within(fs::absolute(absolute).lexically_normal(),root_);}
+    static void checkExternalPath(const fs::path& p){
+        fs::path part;for(auto& component:p){part/=component;DWORD attr=GetFileAttributesW(part.c_str());
+            if(attr==INVALID_FILE_ATTRIBUTES)throw std::runtime_error("A source file is unavailable.");
+            if(attr&FILE_ATTRIBUTE_REPARSE_POINT)throw std::runtime_error("Linked files and folders cannot be copied.");}
+    }
     fs::path path(const fs::path& relative=L".")const {
         if(relative.is_absolute() || relative.has_root_name())throw std::runtime_error("Use a path relative to Storage.");
         auto p=(root_/relative).lexically_normal();
@@ -95,10 +102,15 @@ public:
         if(!ok || !MoveFileExW(temp.c_str(),p.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)) {DeleteFileW(temp.c_str());throw std::runtime_error("Could not save. The previous file was preserved.");}
     }
     void transfer(const fs::path& relative,const fs::path& destination,const std::wstring& name,bool move,Progress progress={}) {
-        auto src=path(relative),dst=fresh(destination,name);
+        transferAbsolute(path(relative),destination,name,move,progress);
+    }
+    void transferAbsolute(const fs::path& source,const fs::path& destination,const std::wstring& name,bool move,Progress progress={}) {
+        auto src=fs::absolute(source).lexically_normal(),dst=fresh(destination,name);
         if(src==root_)throw std::runtime_error("The storage root cannot be moved or copied.");
-        checkTree(src);
+        if(move && !contains(src))throw std::runtime_error("For files outside FileDesk, use Copy, then Paste here.");
         if(fs::is_directory(src) && within(dst,src))throw std::runtime_error("Choose a destination outside the source folder.");
+        checkExternalPath(src);
+        if(fs::is_directory(src))for(auto& e:fs::recursive_directory_iterator(src))checkExternalPath(e.path());
         if(move){report(progress,0,1);fs::rename(src,dst);report(progress,1,1);return;}
         std::vector<fs::path> files{src};
         if(fs::is_directory(src))for(auto& e:fs::recursive_directory_iterator(src))files.push_back(e.path());
@@ -115,6 +127,31 @@ public:
             if(!in.eof())throw std::runtime_error("Copy read failed.");out.flush();if(!out)throw std::runtime_error("Copy write failed.");out.close();
             fs::last_write_time(target,fs::last_write_time(p));report(progress,++done,total);
         }}catch(...){if(created){std::error_code ec;fs::remove_all(dst,ec);}throw;}
+    }
+    PasteResult paste(const std::vector<fs::path>& sources,const fs::path& destination,bool move,Progress progress={}){
+        if(!fs::is_directory(path(destination)))throw std::runtime_error("Open a destination folder before pasting.");
+        // Do not let an external Cut become a destructive import or a silent Copy.
+        if(move)for(auto& source:sources)if(!contains(source))throw std::runtime_error("For files outside FileDesk, use Copy (Ctrl+C), then Paste here. Outside files are never moved.");
+        std::vector<fs::path> unique;
+        for(auto& source:sources){auto p=fs::absolute(source).lexically_normal();if(std::none_of(unique.begin(),unique.end(),[&](auto& q){return lower(q.wstring())==lower(p.wstring());}))unique.push_back(p);}
+        PasteResult result;
+        for(size_t i=0;i<unique.size();++i){auto src=unique[i];
+            // A selected folder already includes its selected children.
+            if(std::any_of(unique.begin(),unique.end(),[&](auto& q){return q!=src && within(src,q);})){++result.skipped;continue;}
+            try{
+                auto dest=path(destination);bool folder=fs::is_directory(src);
+                if(move && lower(src.parent_path().wstring())==lower(dest.wstring())){++result.skipped;continue;}
+                std::wstring name=src.filename().wstring();
+                if(!move && fs::exists(dest/name)){
+                    auto stem=folder?name:src.stem().wstring();auto extension=folder?L"":src.extension().wstring();
+                    unsigned n=1;do{name=stem+L" - Copy"+(n==1?L"":L" ("+std::to_wstring(n)+L")")+extension;++n;}while(fs::exists(dest/name));
+                }
+                transferAbsolute(src,destination,name,move,[&,i](uint64_t done,uint64_t total){if(!total)report(progress,0,0);else report(progress,i*1000+std::min<uint64_t>(1000,done*1000/total),unique.size()*1000);});
+                ++result.completed;
+            }catch(const std::exception& e){result.errors.push_back(src.filename().wstring()+L": "+wide(e.what()));}
+            report(progress,(i+1)*1000,unique.size()*1000);
+        }
+        return result;
     }
     void remove(const fs::path& relative) {
         auto p=path(relative);if(p==root_)throw std::runtime_error("The storage root cannot be deleted.");

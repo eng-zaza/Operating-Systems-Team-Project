@@ -1,4 +1,5 @@
 #include "store.hpp"
+#include "clipboard.hpp"
 #include <commctrl.h>
 #include <optional>
 #include <memory>
@@ -14,7 +15,7 @@
 
 HINSTANCE instance;HFONT font,titleFont;HWND mainWindow,list,searchBox,location,status,progressBar,scopeBox;
 std::unique_ptr<FileStore> store;fs::path current=L".";
-enum {HOME=100,UP,NEWFILE,NEWFOLDER,OPEN,RENAME,COPY,MOVE,REMOVE,BACKUP,REFRESH,SEARCH,BIN,RESTORE,FIND,SCOPE,CLEAR};
+enum {HOME=100,UP,NEWFILE,NEWFOLDER,OPEN,RENAME,COPY,MOVE,REMOVE,BACKUP,REFRESH,SEARCH,BIN,RESTORE,FIND,SCOPE,CLEAR,PASTE,PASTEIN,HELP};
 std::wstring textOf(HWND h){int n=GetWindowTextLengthW(h);std::wstring s(n+1,0);GetWindowTextW(h,s.data(),n+1);s.resize(n);return s;}
 HWND control(HWND parent,const wchar_t* cls,const wchar_t* text,DWORD style,int x,int y,int w,int h,int id=0){
     HWND c=CreateWindowExW(0,cls,text,WS_CHILD|WS_VISIBLE|style,x,y,w,h,parent,(HMENU)(INT_PTR)id,instance,nullptr);
@@ -45,7 +46,12 @@ LRESULT CALLBACK dialogProc(HWND h,UINT msg,WPARAM w,LPARAM l){
         catch(const std::exception& e){error(h,e);}return 0;
     }
     if(msg==WM_CLOSE || (msg==WM_COMMAND && LOWORD(w)==IDCANCEL)){
-        if(!d->editor || !SendMessageW(d->edit,EM_GETMODIFY,0,0) || MessageBoxW(h,L"Discard unsaved changes?",L"Unsaved changes",MB_YESNO|MB_ICONQUESTION)==IDYES)DestroyWindow(h);return 0;
+        if(d->editor && SendMessageW(d->edit,EM_GETMODIFY,0,0)){
+            int answer=MessageBoxW(h,L"Save your changes before closing?\nYes = Save    No = Discard    Cancel = Keep editing",L"Unsaved changes",MB_YESNOCANCEL|MB_ICONQUESTION);
+            if(answer==IDCANCEL)return 0;
+            if(answer==IDYES){try{store->write(d->file,textOf(d->edit));}catch(const std::exception& e){error(h,e);return 0;}}
+        }
+        DestroyWindow(h);return 0;
     }
     return DefWindowProcW(h,msg,w,l);
 }
@@ -54,6 +60,7 @@ void modal(Dialog& d,const wchar_t* title){
     HWND h=CreateWindowExW(WS_EX_DLGMODALFRAME,L"FileDeskDialog",title,WS_CAPTION|WS_SYSMENU,r.left+80,r.top+80,d.editor?780:560,d.editor?540:200,mainWindow,nullptr,instance,&d);
     if(!h)throw std::runtime_error("Cannot create dialog.");
     EnableWindow(mainWindow,FALSE);ShowWindow(h,SW_SHOW);SetFocus(d.edit);
+    if(!d.editor)SendMessageW(d.edit,EM_SETSEL,0,-1);
     MSG msg;while(IsWindow(h) && GetMessageW(&msg,nullptr,0,0)>0){
         if(d.editor && msg.message==WM_KEYDOWN && msg.wParam=='S' && GetKeyState(VK_CONTROL)<0){SendMessageW(h,WM_COMMAND,IDOK,0);continue;}
         if(d.editor && msg.message==WM_KEYDOWN && msg.wParam==VK_RETURN && msg.hwnd==d.edit){TranslateMessage(&msg);DispatchMessageW(&msg);continue;}
@@ -65,7 +72,7 @@ std::optional<std::wstring> ask(const wchar_t* title,const wchar_t* label,std::w
     Dialog d;d.label=label;d.value=initial;modal(d,title);if(d.accepted)return d.value;return {};
 }
 struct Row {fs::path path;std::wstring id,name,type,size,date,where;bool folder=false;};
-struct Result {std::vector<Row> items;std::wstring message;bool listing=false,reload=false;};
+struct Result {std::vector<Row> items;std::wstring message;bool listing=false,reload=false;std::wstring notice;DWORD clearClipboard=0;};
 std::vector<Row> items;
 std::future<Result> job;
 // Workers publish counters only. The UI thread alone updates windows and consumes results.
@@ -73,6 +80,9 @@ std::atomic<uint64_t> jobDone{0},jobTotal{0};
 bool busy=false,binView=false,closing=false;
 std::wstring jobLabel,afterReload;
 std::vector<HWND> buttons;
+std::vector<fs::path> cutPaths,dragPaths;
+DWORD cutSequence=0;
+bool dragging=false;
 void refresh();
 void progressMode(bool indeterminate){
     LONG_PTR style=GetWindowLongPtrW(progressBar,GWL_STYLE);
@@ -80,15 +90,23 @@ void progressMode(bool indeterminate){
     else{SendMessageW(progressBar,PBM_SETMARQUEE,FALSE,0);SetWindowLongPtrW(progressBar,GWL_STYLE,style&~PBS_MARQUEE);}
 }
 void updateActions(){
-    bool selected=ListView_GetNextItem(list,-1,LVNI_SELECTED)>=0;
+    UINT count=ListView_GetSelectedCount(list);bool selected=count>0;
     for(auto h:buttons){int id=GetDlgCtrlID(h);bool enabled=!busy;
         if(id==OPEN || id==RENAME || id==COPY || id==MOVE || id==REMOVE)enabled=enabled && selected && !binView;
+        if(id==OPEN || id==RENAME || id==REMOVE || id==RESTORE)enabled=enabled && count==1;
         if(id==RESTORE)enabled=enabled && selected && binView;
         if(id==NEWFILE || id==NEWFOLDER || id==UP)enabled=enabled && !binView;
         if(id==FIND || id==CLEAR)enabled=enabled && !binView;
+        if(id==PASTE)enabled=enabled && !binView && IsClipboardFormatAvailable(CF_HDROP);
+        if(id==UP)enabled=enabled && current!=L".";
         EnableWindow(h,enabled);
     }
     EnableWindow(searchBox,!busy && !binView);EnableWindow(scopeBox,!busy && !binView);
+}
+void showCutState(){
+    if(cutSequence!=GetClipboardSequenceNumber()){cutPaths.clear();cutSequence=0;}
+    for(size_t i=0;i<items.size();++i){bool cut=!binView && std::any_of(cutPaths.begin(),cutPaths.end(),[&](auto& p){return p==items[i].path;});ListView_SetItemState(list,(int)i,cut?LVIS_CUT:0,LVIS_CUT);}
+    updateActions();
 }
 void beginJob(std::wstring label,std::function<Result(Progress)> work){
     if(busy)return;
@@ -118,13 +136,16 @@ void renderRows(Result& result){
     }
     LVCOLUMNW c{};c.mask=LVCF_TEXT;c.pszText=(wchar_t*)(binView?L"Deleted":L"Modified");ListView_SetColumn(list,3,&c);
     SendMessageW(list,WM_SETREDRAW,TRUE,0);InvalidateRect(list,nullptr,TRUE);
-    SetWindowTextW(status,(afterReload.empty()?result.message:afterReload+L"  "+result.message).c_str());afterReload.clear();updateActions();
+    SetWindowTextW(status,(afterReload.empty()?result.message:afterReload+L"  "+result.message).c_str());afterReload.clear();showCutState();
+    // Navigation disables its focused button during a job. Return keyboard focus
+    // to the file list so Paste works immediately after opening a destination.
+    if(GetForegroundWindow()==mainWindow)SetFocus(list);
 }
 void refresh(){
     if(busy)return;
     auto folder=current;auto query=textOf(searchBox);bool recursive=SendMessageW(scopeBox,BM_GETCHECK,0,0)==BST_CHECKED;
     bool trash=binView;
-    SetWindowTextW(location,trash?L"Recycle bin / restore to original location":(L"Storage / "+(current==L"."?L"":current.wstring())).c_str());
+    SetWindowTextW(location,trash?L"Recycle bin — select an item, then Restore":(L"My files / "+(current==L"."?L"":current.wstring())).c_str());
     beginJob(trash?L"Loading recycle bin...":L"Searching files...",[folder,query,recursive,trash](Progress progress){
         Result result;result.listing=true;
         if(trash){for(auto& r:store->trashItems())result.items.push_back({r.original,r.id,r.original.filename().wstring(),r.folder?L"Folder":L"File",L"-",r.deleted,r.original.wstring(),r.folder});
@@ -132,25 +153,84 @@ void refresh(){
         auto found=store->search(folder,query,recursive && !query.empty(),progress);
         for(auto& relative:found.paths){try{auto p=store->path(relative);bool directory=fs::is_directory(p);result.items.push_back({relative,L"",p.filename().wstring(),directory?L"Folder":L"File",directory?L"-":sizeLabel(fs::file_size(p)),modified(p),relative.parent_path().wstring(),directory});}catch(const std::exception&){++found.skipped;}}
         std::sort(result.items.begin(),result.items.end(),[](auto& a,auto& b){if(a.folder!=b.folder)return a.folder;return lower(a.path.wstring())<lower(b.path.wstring());});
-        result.message=std::to_wstring(result.items.size())+(result.items.size()==1?L" item. ":L" items. ")+(query.empty()?L"Double-click to open. Delete moves to Recycle bin.":L"Search complete. Location shows each match's folder.");
+        result.message=std::to_wstring(result.items.size())+(result.items.size()==1?L" item. ":L" items. ")+(query.empty()?L"Drag onto a folder to move. Hold Ctrl to copy. Ctrl+V to paste here.":L"Search complete. Location shows each match's folder.");
         if(result.items.empty())result.message=query.empty()?L"This folder is empty. Choose New file or New folder to start.":L"No matching names. Try another search or change the subfolder option.";
         if(found.skipped)result.message+=L" Skipped "+std::to_wstring(found.skipped)+L" inaccessible or linked items.";
         if(found.truncated)result.message+=L" Showing the first 5,000 matches; narrow your search.";
         return result;
     });
 }
-Row selected(){int i=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(i<0 || i>=(int)items.size())throw std::runtime_error("Select a file or folder first.");return items[i];}
+Row selected(){int i=ListView_GetNextItem(list,-1,LVNI_SELECTED);if(i<0 || i>=(int)items.size())throw std::runtime_error("Select a file or folder first.");if(ListView_GetSelectedCount(list)!=1)throw std::runtime_error("Choose one item for this action. Copy and Cut support multiple items.");return items[i];}
+std::vector<fs::path> selectedPaths(){
+    std::vector<fs::path> paths;for(int i=-1;(i=ListView_GetNextItem(list,i,LVNI_SELECTED))!=-1;){if(i<(int)items.size())paths.push_back(store->path(items[i].path));}
+    if(paths.empty())throw std::runtime_error("Select one or more files first.");return paths;
+}
+void pasteInto(const std::vector<fs::path>& paths,const fs::path& destination,bool cut,DWORD sequence=0){
+    if(busy || binView || paths.empty())return;
+    beginJob(cut?L"Moving your files...":L"Copying your files...",[paths,destination,cut,sequence](Progress progress){
+        auto pasted=store->paste(paths,destination,cut,progress);Result result;result.reload=true;
+        result.message=(cut?L"Moved ":L"Copied ")+std::to_wstring(pasted.completed)+(pasted.completed==1?L" item.":L" items.");
+        if(pasted.skipped)result.message+=L" "+std::to_wstring(pasted.skipped)+L" already in that folder or included in another selection.";
+        if(!pasted.errors.empty()){
+            result.message+=L" "+std::to_wstring(pasted.errors.size())+L" could not be transferred.";
+            result.notice=L"Some items could not be transferred. Completed items remain in the destination.\n\n";
+            for(size_t i=0;i<std::min<size_t>(pasted.errors.size(),8);++i)result.notice+=pasted.errors[i]+L"\n";
+        }else if(cut)result.clearClipboard=sequence;
+        return result;
+    });
+}
+void publishSelection(bool cut){
+    auto paths=selectedPaths();cutSequence=copyFileClipboard(mainWindow,paths,cut);cutPaths.clear();
+    if(cut)for(auto& p:paths)cutPaths.push_back(p.lexically_relative(store->root()));
+    showCutState();SetWindowTextW(status,(std::to_wstring(paths.size())+(cut?L" item(s) cut. Open a folder, then click Paste (Ctrl+V).":L" item(s) copied. Open a folder, then click Paste (Ctrl+V).")).c_str());
+}
+std::optional<fs::path> dropDestination(POINT screen){
+    POINT pt=screen;ScreenToClient(list,&pt);RECT bounds;GetClientRect(list,&bounds);
+    ListView_SetItemState(list,-1,0,LVIS_DROPHILITED);
+    if(!PtInRect(&bounds,pt))return {};
+    LVHITTESTINFO hit{};hit.pt=pt;int i=ListView_HitTest(list,&hit);
+    if(i>=0 && i<(int)items.size()){
+        if(!items[i].folder)return {};
+        ListView_SetItemState(list,i,LVIS_DROPHILITED,LVIS_DROPHILITED);return items[i].path;
+    }
+    // The header is not a destination.
+    if(pt.y<26)return {};return current;
+}
+void finishDrag(bool cancel){
+    auto paths=dragPaths;dragPaths.clear();dragging=false;ReleaseCapture();
+    POINT screen;GetCursorPos(&screen);auto destination=cancel?std::optional<fs::path>{}:dropDestination(screen);
+    ListView_SetItemState(list,-1,0,LVIS_DROPHILITED);
+    if(destination)pasteInto(paths,*destination,(GetKeyState(VK_CONTROL)&0x8000)==0);
+    else SetWindowTextW(status,L"Drag cancelled. Your files have not moved.");
+}
+void receiveFileDrop(HDROP drop,HWND receiver){
+    try{
+        POINT pt;DragQueryPoint(drop,&pt);ClientToScreen(receiver,&pt);auto destination=dropDestination(pt);
+        auto paths=readFileDrop(drop);DragFinish(drop);drop=nullptr;
+        ListView_SetItemState(list,-1,0,LVIS_DROPHILITED);
+        if(busy)throw std::runtime_error("Wait for the current operation to finish, then drop the files again.");
+        if(binView || !destination)throw std::runtime_error("Drop files onto a folder or the empty area in My files.");
+        // Incoming Explorer drops copy only; external source files remain untouched.
+        pasteInto(paths,*destination,false);
+    }catch(const std::exception& e){if(drop)DragFinish(drop);error(mainWindow,e);}
+}
+LRESULT CALLBACK listSubclass(HWND h,UINT msg,WPARAM w,LPARAM l,UINT_PTR,DWORD_PTR){
+    if(msg==WM_DROPFILES){receiveFileDrop((HDROP)w,h);return 0;}
+    return DefSubclassProc(h,msg,w,l);
+}
 void action(int id){
     if(busy)return;
+    if(id==HELP){MessageBoxW(mainWindow,L"Move files\nSelect files, click Cut (Ctrl+X), open a folder, then Paste (Ctrl+V).\n\nCopy files\nUse Copy (Ctrl+C), then Paste. Existing files are kept; copies get a new name.\n\nDrag and drop\nDrag onto a folder to move. Hold Ctrl to copy. Drop onto empty space to use the folder currently open.\n\nWindows Explorer\nCopy files in Explorer, then Paste here, or drag them in. Incoming files are copied; originals stay where they are.\n\nSelect several items\nHold Ctrl to select individual files, or Shift to select a range.\n\nRecover a deleted item\nOpen Recycle bin, select an item, and click Restore.",L"How to use FileDesk",MB_OK|MB_ICONINFORMATION);return;}
+    if((id==COPY || id==MOVE) && !binView){publishSelection(id==MOVE);return;}
+    if((id==PASTE || id==PASTEIN) && !binView){auto files=readFileClipboard(mainWindow);auto destination=id==PASTEIN?selected().path:current;pasteInto(files.paths,destination,files.cut,files.sequence);return;}
     if(id==FIND || id==REFRESH){refresh();return;}
     if(id==CLEAR){SetWindowTextW(searchBox,L"");refresh();return;}
     if(id==HOME || id==UP || id==BIN){binView=id==BIN;current=id==UP?current.parent_path():fs::path(L".");if(current.empty())current=L".";SetWindowTextW(searchBox,L"");refresh();return;}
     if(id==RESTORE){if(!binView)return;auto row=selected();beginJob(L"Restoring item...",[row](Progress p){auto original=store->restore(row.id,p);return Result{{},L"Restored: "+original.wstring(),false,true};});return;}
     if(binView && id!=BACKUP)return;
-    if(id==NEWFILE || id==NEWFOLDER){auto name=ask(id==NEWFILE?L"New file":L"New folder",L"Name (for example: notes.txt or Documents):");if(name){store->create(current,*name,id==NEWFOLDER);afterReload=L"Created "+*name+L".";}}
+    if(id==NEWFILE || id==NEWFOLDER){auto name=ask(id==NEWFILE?L"New text file":L"New folder",id==NEWFILE?L"Give your text file a name:":L"Give your folder a name:",id==NEWFILE?L"New file.txt":L"New folder");if(name){store->create(current,*name,id==NEWFOLDER);afterReload=L"Created "+*name+L".";}}
     else if(id==OPEN){auto row=selected();if(row.folder){current=row.path;SetWindowTextW(searchBox,L"");}else{Dialog d;d.editor=true;d.file=row.path;d.value=store->read(row.path);modal(d,(L"Edit: "+row.name).c_str());}}
     else if(id==RENAME){auto row=selected();auto name=ask(L"Rename",L"New name:",row.name);if(name && *name!=row.name){beginJob(L"Renaming item...",[row,name](Progress p){store->transfer(row.path,row.path.parent_path(),*name,true,p);return Result{{},L"Renamed to "+*name,false,true};});return;}}
-    else if(id==COPY || id==MOVE){auto row=selected();auto dest=ask(id==MOVE?L"Move":L"Copy",L"Existing destination folder relative to Storage (. means root):",current.wstring());if(!dest)return;auto name=ask(L"Destination name",L"Name at destination:",row.name);if(name){beginJob(id==MOVE?L"Moving files...":L"Copying files...",[row,dest,name,id](Progress p){store->transfer(row.path,*dest,*name,id==MOVE,p);return Result{{},id==MOVE?L"Move complete.":L"Copy complete.",false,true};});return;}}
     else if(id==REMOVE){auto row=selected();if(MessageBoxW(mainWindow,(L"Move "+row.name+L" to FileDesk's recycle bin?\nYou can restore it later.").c_str(),L"Move to recycle bin",MB_YESNO|MB_ICONQUESTION)==IDYES){beginJob(L"Moving to recycle bin...",[row](Progress p){store->recycle(row.path,p);return Result{{},L"Moved to recycle bin. Choose Recycle bin to restore.",false,true};});return;}}
     else if(id==BACKUP){auto folder=store->root().parent_path()/L"backups";fs::create_directories(folder);SYSTEMTIME t;GetLocalTime(&t);wchar_t name[100];swprintf_s(name,L"FileDesk-%04u%02u%02u-%02u%02u%02u-%03u.zip",t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds);auto dest=folder/name;
         beginJob(L"Creating ZIP backup...",[dest](Progress p){store->backup(dest,p);return Result{{},L"Backup saved: backups/"+dest.filename().wstring(),false,true};});return;}
@@ -163,7 +243,9 @@ void pollJob(){
     if(job.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
     KillTimer(mainWindow,1);progressMode(false);busy=false;
     try{auto result=job.get();SendMessageW(progressBar,PBM_SETPOS,100,0);
+        if(result.clearClipboard)clearCutClipboard(mainWindow,result.clearClipboard);
         if(closing){DestroyWindow(mainWindow);return;}
+        if(!result.notice.empty())MessageBoxW(mainWindow,result.notice.c_str(),L"Transfer summary",MB_OK|MB_ICONINFORMATION);
         if(result.listing)renderRows(result);else if(result.reload){afterReload=result.message;refresh();}else SetWindowTextW(status,result.message.c_str());
     }catch(const std::exception& e){if(closing){DestroyWindow(mainWindow);return;}SendMessageW(progressBar,PBM_SETPOS,0,0);SetWindowTextW(status,L"Operation failed. Review the error and try again.");error(mainWindow,e);}
     updateActions();
@@ -180,49 +262,68 @@ LRESULT CALLBACK windowProc(HWND h,UINT msg,WPARAM w,LPARAM l){
     try{
         if(msg==WM_CREATE){mainWindow=h;
             auto title=control(h,L"STATIC",L"FileDesk",0,24,14,400,48);SendMessageW(title,WM_SETFONT,(WPARAM)titleFont,TRUE);
-            control(h,L"STATIC",L"Your files, organized. Search folders, recover deleted items, and keep a backup.",0,26,68,1000,26);
+            control(h,L"STATIC",L"Drag files onto a folder, or use Copy / Cut and Paste. Your files stay under My files.",0,26,68,1000,26);
             control(h,L"STATIC",L"Search by name",0,24,115,122,24);
             searchBox=control(h,L"EDIT",L"",WS_BORDER|ES_AUTOHSCROLL|WS_TABSTOP,148,108,476,32,SEARCH);SendMessageW(searchBox,EM_SETCUEBANNER,TRUE,(LPARAM)L"Type a filename and press Enter");
             buttons.push_back(control(h,L"BUTTON",L"Search",WS_TABSTOP,640,108,90,32,FIND));buttons.push_back(control(h,L"BUTTON",L"Clear",WS_TABSTOP,740,108,76,32,CLEAR));
             scopeBox=control(h,L"BUTTON",L"Include subfolders",WS_TABSTOP|BS_AUTOCHECKBOX,830,110,190,28,SCOPE);SendMessageW(scopeBox,BM_SETCHECK,BST_CHECKED,0);
             struct Tool{int id;const wchar_t* title;};
-            Tool nav[]={{HOME,L"Home"},{UP,L"Up"},{NEWFILE,L"New file"},{NEWFOLDER,L"New folder"},{OPEN,L"Open / Edit"},{RENAME,L"Rename"},{COPY,L"Copy"},{MOVE,L"Move"}};
+            Tool nav[]={{HOME,L"My files"},{UP,L"Up a folder"},{NEWFILE,L"New text file"},{NEWFOLDER,L"New folder"},{OPEN,L"Open"},{COPY,L"Copy"},{MOVE,L"Cut"},{PASTE,L"Paste"}};
             for(int i=0;i<8;++i)buttons.push_back(control(h,L"BUTTON",nav[i].title,WS_TABSTOP,24+i*128,154,120,34,nav[i].id));
-            Tool second[]={{REMOVE,L"Recycle"},{BIN,L"Recycle bin"},{RESTORE,L"Restore"},{BACKUP,L"Backup ZIP"},{REFRESH,L"Refresh"}};
-            for(int i=0;i<5;++i)buttons.push_back(control(h,L"BUTTON",second[i].title,WS_TABSTOP,24+i*128,198,120,34,second[i].id));
-            control(h,L"STATIC",L"F2 Rename   •   Delete Recycle   •   Ctrl+F Search",0,680,206,410,24);
-            location=control(h,L"STATIC",L"Storage /",0,24,244,1000,28);
-            list=control(h,WC_LISTVIEWW,L"",WS_BORDER|WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,24,282,1060,340);
+            Tool second[]={{RENAME,L"Rename"},{REMOVE,L"Move to trash"},{BIN,L"Recycle bin"},{RESTORE,L"Restore"},{BACKUP,L"Back up files"},{REFRESH,L"Refresh"},{HELP,L"How to use"}};
+            for(int i=0;i<7;++i)buttons.push_back(control(h,L"BUTTON",second[i].title,WS_TABSTOP,24+i*128,198,120,34,second[i].id));
+            location=control(h,L"STATIC",L"My files /",0,24,244,1000,28);
+            list=control(h,WC_LISTVIEWW,L"",WS_BORDER|WS_TABSTOP|LVS_REPORT|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,24,282,1060,340);
             ListView_SetExtendedListViewStyle(list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
             SHFILEINFOW shell{};auto icons=(HIMAGELIST)SHGetFileInfoW(L"file.txt",FILE_ATTRIBUTE_NORMAL,&shell,sizeof shell,SHGFI_SYSICONINDEX|SHGFI_SMALLICON|SHGFI_USEFILEATTRIBUTES);ListView_SetImageList(list,icons,LVSIL_SMALL);
             const wchar_t* heads[]={L"Name",L"Type",L"Size",L"Modified",L"Location / Original path"};
             for(int i=0;i<5;++i){LVCOLUMNW c{};c.mask=LVCF_TEXT|LVCF_WIDTH;c.pszText=(wchar_t*)heads[i];c.cx=180;ListView_InsertColumn(list,i,&c);}
             status=control(h,L"STATIC",L"Ready",0,24,630,1060,38);
             progressBar=control(h,PROGRESS_CLASSW,L"",PBS_SMOOTH|PBS_MARQUEE,24,680,1060,12);SendMessageW(progressBar,PBM_SETRANGE32,0,100);
+            DragAcceptFiles(h,TRUE);DragAcceptFiles(list,TRUE);SetWindowSubclass(list,listSubclass,1,0);AddClipboardFormatListener(h);
             layout(h);refresh();return 0;
         }
         if(msg==WM_SIZE && list){layout(h);return 0;}
         if(msg==WM_GETMINMAXINFO){auto m=(MINMAXINFO*)l;m->ptMinTrackSize={1120,650};return 0;}
         if(msg==WM_TIMER && w==1){pollJob();return 0;}
+        if(msg==WM_CLIPBOARDUPDATE){if(list)showCutState();return 0;}
+        if(msg==WM_DROPFILES){receiveFileDrop((HDROP)w,h);return 0;}
+        if(msg==WM_MOUSEMOVE && dragging){
+            POINT pt;GetCursorPos(&pt);auto destination=dropDestination(pt);
+            SetCursor(LoadCursorW(nullptr,destination?IDC_ARROW:IDC_NO));
+            if(destination)SetWindowTextW(status,(((GetKeyState(VK_CONTROL)&0x8000)?L"Copy to ":L"Move to ")+std::wstring(L"My files / ")+(destination==L"."?L"":destination->wstring())+L" — release to drop; Esc to cancel").c_str());
+            else SetWindowTextW(status,L"Drop onto a folder or an empty area. Esc cancels the drag.");return 0;
+        }
+        if(msg==WM_LBUTTONUP && dragging){finishDrag(false);return 0;}
+        if(msg==WM_CAPTURECHANGED && dragging){dragging=false;dragPaths.clear();ListView_SetItemState(list,-1,0,LVIS_DROPHILITED);return 0;}
         if(msg==WM_COMMAND){if(LOWORD(w)!=SEARCH && LOWORD(w)!=SCOPE && HIWORD(w)==BN_CLICKED)action(LOWORD(w));return 0;}
         if(msg==WM_NOTIFY && ((NMHDR*)l)->hwndFrom==list){auto n=(NMHDR*)l;
             if(n->code==NM_DBLCLK)action(binView?RESTORE:OPEN);
             if(n->code==LVN_ITEMCHANGED)updateActions();
+            if(n->code==LVN_BEGINDRAG && !busy && !binView){dragPaths=selectedPaths();dragging=true;SetCapture(h);SetWindowTextW(status,L"Drag onto a folder to move. Hold Ctrl to copy. Esc cancels.");}
             return 0;
         }
         if(msg==WM_CONTEXTMENU && (HWND)w==list && !busy){
             POINT pt{(short)LOWORD(l),(short)HIWORD(l)};
-            if(pt.x!=-1){POINT local=pt;ScreenToClient(list,&local);LVHITTESTINFO hit{};hit.pt=local;int i=ListView_HitTest(list,&hit);if(i<0)return 0;ListView_SetItemState(list,i,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);}
+            int hitIndex=-1;
+            if(pt.x!=-1){POINT local=pt;ScreenToClient(list,&local);LVHITTESTINFO hit{};hit.pt=local;hitIndex=ListView_HitTest(list,&hit);if(hitIndex>=0 && !(ListView_GetItemState(list,hitIndex,LVIS_SELECTED)&LVIS_SELECTED)){ListView_SetItemState(list,-1,0,LVIS_SELECTED);ListView_SetItemState(list,hitIndex,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);}}
             else {GetCursorPos(&pt);}
-            if(ListView_GetNextItem(list,-1,LVNI_SELECTED)<0)return 0;
             HMENU menu=CreatePopupMenu();
-            if(binView)AppendMenuW(menu,MF_STRING,RESTORE,L"Restore to original location");
-            else {AppendMenuW(menu,MF_STRING,OPEN,L"Open / Edit\tEnter");AppendMenuW(menu,MF_STRING,RENAME,L"Rename\tF2");AppendMenuW(menu,MF_STRING,COPY,L"Copy...");AppendMenuW(menu,MF_STRING,MOVE,L"Move...");AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,REMOVE,L"Move to recycle bin\tDelete");}
+            UINT count=ListView_GetSelectedCount(list);bool onItem=hitIndex>=0 || (short)LOWORD(l)==-1;
+            if(binView){if(count==1 && onItem)AppendMenuW(menu,MF_STRING,RESTORE,L"Restore to original location");else{DestroyMenu(menu);return 0;}}
+            else {
+                if(count && onItem){
+                    if(count==1){AppendMenuW(menu,MF_STRING,OPEN,L"Open\tEnter");AppendMenuW(menu,MF_STRING,RENAME,L"Rename\tF2");}
+                    AppendMenuW(menu,MF_STRING,COPY,L"Copy\tCtrl+C");AppendMenuW(menu,MF_STRING,MOVE,L"Cut\tCtrl+X");
+                    if(count==1 && selected().folder)AppendMenuW(menu,MF_STRING|(IsClipboardFormatAvailable(CF_HDROP)?0:MF_GRAYED),PASTEIN,L"Paste into this folder");
+                    if(count==1){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,REMOVE,L"Move to recycle bin\tDelete");}
+                }else{AppendMenuW(menu,MF_STRING|(IsClipboardFormatAvailable(CF_HDROP)?0:MF_GRAYED),PASTE,L"Paste here\tCtrl+V");AppendMenuW(menu,MF_STRING,NEWFOLDER,L"New folder");AppendMenuW(menu,MF_STRING,NEWFILE,L"New text file");}
+            }
             int cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,h,nullptr);DestroyMenu(menu);if(cmd)action(cmd);return 0;
         }
         if(msg==WM_CTLCOLORSTATIC){SetTextColor((HDC)w,RGB(20,44,73));SetBkColor((HDC)w,RGB(238,242,247));SetDCBrushColor((HDC)w,RGB(238,242,247));return (LRESULT)GetStockObject(DC_BRUSH);}
         if(msg==WM_CLOSE){if(busy){closing=true;SetWindowTextW(status,L"Finishing the current operation before closing...");return 0;}DestroyWindow(h);return 0;}
-        if(msg==WM_DESTROY){PostQuitMessage(0);return 0;}
+        if(msg==WM_DESTROY){RemoveClipboardFormatListener(h);PostQuitMessage(0);return 0;}
     }catch(const std::exception& e){error(h,e);return 0;}
     return DefWindowProcW(h,msg,w,l);
 }
@@ -237,11 +338,18 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE,PWSTR,int show){
         HWND h=CreateWindowW(L"FileDeskMain",L"FileDesk | C++ File Management System",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1180,800,nullptr,nullptr,inst,nullptr);
         if(!h)throw std::runtime_error("Cannot create the main window.");ShowWindow(h,show);UpdateWindow(h);
         MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){
-            if(msg.message==WM_KEYDOWN && !busy){
+            if(dragging && msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE){finishDrag(true);continue;}
+            if((msg.message==WM_KEYDOWN || msg.message==WM_SYSKEYDOWN) && !busy){
                 int command=0;
                 if(msg.wParam==VK_F5)command=REFRESH;
+                else if(msg.wParam==VK_UP && GetKeyState(VK_MENU)<0)command=UP;
+                else if(msg.wParam=='N' && GetKeyState(VK_CONTROL)<0 && GetKeyState(VK_SHIFT)<0)command=NEWFOLDER;
                 else if(msg.wParam=='F' && GetKeyState(VK_CONTROL)<0){SetFocus(searchBox);SendMessageW(searchBox,EM_SETSEL,0,-1);continue;}
                 else if(msg.hwnd==searchBox && msg.wParam==VK_RETURN)command=FIND;
+                else if(msg.hwnd!=searchBox && GetKeyState(VK_CONTROL)<0){
+                    if(msg.wParam=='C')command=COPY;if(msg.wParam=='X')command=MOVE;if(msg.wParam=='V')command=PASTE;
+                    if(msg.wParam=='A' && msg.hwnd==list){ListView_SetItemState(list,-1,LVIS_SELECTED,LVIS_SELECTED);continue;}
+                }
                 else if(msg.hwnd==list){if(msg.wParam==VK_RETURN)command=binView?RESTORE:OPEN;if(msg.wParam==VK_F2)command=RENAME;if(msg.wParam==VK_DELETE)command=REMOVE;}
                 if(command){SendMessageW(h,WM_COMMAND,command,0);continue;}
             }
